@@ -1,0 +1,17 @@
+# Copy this file to mcp/servers.local.yaml on a device. It is gitignored.
+# Values here deep-merge over mcp/servers.yaml.
+#
+# servers:
+#   homeassistant:
+#     env:
+#       HASS_HOST: http://192.168.1.20:8123
+#
+#   context7:
+#     enabled: true
+#
+#   # Add a device-only server:
+#   local-files:
+#     transport: stdio
+#     command: npx
+#     args: ["-y", "@modelcontextprotocol/server-filesystem", "/home/me/projects"]
+#     targets: [codex, opencode]

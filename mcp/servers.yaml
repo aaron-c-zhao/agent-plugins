@@ -1,0 +1,40 @@
+version: 1
+
+# One catalog for every device. Render native config for each agent with:
+#   agenthub sync
+#
+# Secrets are never stored here. Use ${VAR} placeholders; each agent resolves
+# them from its own environment (Hermes also reads ~/.hermes/.env).
+#
+# Per-device differences (paths, hostnames, extra servers) belong in
+# mcp/servers.local.yaml, which is gitignored.
+
+servers:
+  homeassistant:
+    description: Home Assistant control and state access
+    transport: stdio
+    command: uvx
+    args:
+      - homeassistant-mcp
+    env:
+      HASS_HOST: http://homeassistant.local:8123
+      HASS_TOKEN: ${HA_TOKEN}
+    targets:
+      - codex
+      - opencode
+      - hermes
+      - claude
+
+  # Template for a remote server. Enable it per device and provide the key.
+  context7:
+    description: Up-to-date library documentation
+    enabled: false
+    transport: http
+    url: https://mcp.context7.com/mcp
+    headers:
+      CONTEXT7_API_KEY: ${CONTEXT7_API_KEY}
+    oauth: false
+    targets:
+      - codex
+      - opencode
+      - hermes

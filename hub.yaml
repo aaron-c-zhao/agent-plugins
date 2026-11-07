@@ -1,0 +1,44 @@
+version: 1
+
+# Canonical skills. This directory is also the cross-agent convention that
+# OpenCode and Hermes read directly from ~/.agents/skills.
+skills:
+  source: .agents/skills
+  exclude:
+    - ".openspec-target"
+    - "**/node_modules/**"
+    - "**/__pycache__/**"
+
+# `enabled: auto` means: enable when the agent's config directory or binary
+# is present on this device. Override any path per device if needed.
+targets:
+  agents:
+    enabled: true
+  codex:
+    enabled: auto
+  opencode:
+    enabled: auto
+    # OpenCode reads ~/.agents/skills globally; no second set of links needed.
+    skills_mode: external
+  hermes:
+    enabled: auto
+    # Hermes reads ~/.agents/skills through skills.external_dirs.
+    skills_mode: external
+  claude:
+    enabled: auto
+  gemini:
+    enabled: auto
+
+# Additional agent assets (rules, prompts, commands, subagents, etc.).
+# Each asset is symlinked into the per-agent directory shown below.
+#
+# assets:
+#   rules:
+#     source: rules
+#     install:
+#       codex: ~/.codex/rules
+#       claude: ~/.claude/rules
+#   commands:
+#     source: commands
+#     install:
+#       opencode: ~/.config/opencode/commands
