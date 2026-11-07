@@ -1,0 +1,1375 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = [
+#   "tomlkit>=0.13",
+#   "ruamel.yaml>=0.18",
+#   "json5>=0.9",
+#   "textual>=0.80",
+# ]
+# ///
+"""agenthub - one Git repo for skills, MCP servers, and other agent assets.
+
+The repo is the source of truth. `agenthub sync` materializes it into the
+native locations that Codex, OpenCode, Hermes, Claude, and other agents read.
+Nothing is copied unless you pass --copy; links stay live.
+
+Commands:
+  sync     Link skills and render MCP config for detected agents
+  update   git pull --ff-only, then sync
+  status   Show drift between this repo and the local agents
+  doctor   Diagnose the installation and missing environment variables
+  tui      Launch the interactive terminal UI
+  mcp      List the managed MCP catalog
+"""
+
+from __future__ import annotations
+
+import argparse
+import ast
+import copy
+import hashlib
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+try:
+    import json5
+    import tomlkit
+    from ruamel.yaml import YAML
+    from ruamel.yaml.comments import CommentedMap, CommentedSeq
+except ImportError as exc:  # pragma: no cover - uv installs these
+    sys.exit(f"agenthub: missing dependency {exc.name}. Run with: uv run {sys.argv[0]}")
+
+
+# ---------------------------------------------------------------------------
+# Paths and constants
+# ---------------------------------------------------------------------------
+
+REPO_ROOT = Path(__file__).resolve().parent
+HUB_CONFIG = REPO_ROOT / "hub.yaml"
+MCP_CATALOG = REPO_ROOT / "mcp" / "servers.yaml"
+MCP_LOCAL = REPO_ROOT / "mcp" / "servers.local.yaml"
+DEFAULT_SKILLS_SOURCE = REPO_ROOT / ".agents" / "skills"
+
+STATE_DIR = Path(
+    os.environ.get("XDG_STATE_HOME", Path.home() / ".local" / "state")
+) / "agenthub"
+STATE_FILE = STATE_DIR / "state.json"
+BACKUP_DIR = STATE_DIR / "backups"
+QUARANTINE_DIR = STATE_DIR / "quarantine"
+
+PLACEHOLDER = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
+PLACEHOLDER_FULL = re.compile(r"^\$\{([A-Za-z_][A-Za-z0-9_]*)\}$")
+
+GREEN, YELLOW, RED, BLUE, DIM, RESET = (
+    ("\033[32m", "\033[33m", "\033[31m", "\033[34m", "\033[2m", "\033[0m")
+    if sys.stdout.isatty() and not os.environ.get("NO_COLOR")
+    else ("", "", "", "", "", "")
+)
+
+
+def say(msg: str = "") -> None:
+    print(msg)
+
+
+def ok(msg: str) -> None:
+    print(f"{GREEN}✓{RESET} {msg}")
+
+
+def warn(msg: str) -> None:
+    print(f"{YELLOW}!{RESET} {msg}")
+
+
+def fail(msg: str) -> None:
+    print(f"{RED}✗{RESET} {msg}", file=sys.stderr)
+
+
+def info(msg: str) -> None:
+    print(f"{BLUE}·{RESET} {msg}")
+
+
+# ---------------------------------------------------------------------------
+# Small utilities
+# ---------------------------------------------------------------------------
+
+
+def expand_path(value: str | Path) -> Path:
+    path = Path(os.path.expandvars(os.path.expanduser(str(value))))
+    return path if path.is_absolute() else (REPO_ROOT / path)
+
+
+def read_text(path: Path) -> str:
+    return path.read_text(encoding="utf-8")
+
+
+def atomic_write(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(text)
+        os.replace(tmp, path)
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+
+
+def timestamp() -> str:
+    return datetime.now().strftime("%Y%m%d-%H%M%S")
+
+
+def deep_merge(base: Any, override: Any) -> Any:
+    if isinstance(base, dict) and isinstance(override, dict):
+        merged = copy.deepcopy(base)
+        for key, value in override.items():
+            merged[key] = deep_merge(merged.get(key), value)
+        return merged
+    return copy.deepcopy(override)
+
+
+def load_yaml(path: Path, *, plain: bool = True) -> Any:
+    yaml = YAML(typ="safe" if plain else "rt")
+    with path.open(encoding="utf-8") as handle:
+        return yaml.load(handle) or ({} if plain else CommentedMap())
+
+
+def dump_yaml(data: Any) -> str:
+    yaml = YAML()
+    yaml.preserve_quotes = True
+    yaml.width = 4096
+    yaml.indent(mapping=2, sequence=4, offset=2)
+    from io import StringIO
+
+    buffer = StringIO()
+    yaml.dump(data, buffer)
+    return buffer.getvalue()
+
+
+def load_jsonc(path: Path) -> Any:
+    text = read_text(path)
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        return json5.loads(text)
+
+
+def dump_json(data: Any) -> str:
+    return json.dumps(data, indent=2, ensure_ascii=False) + "\n"
+
+
+def sha256_text(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def tree_hash(root: Path) -> str:
+    digest = hashlib.sha256()
+    for path in sorted(p for p in root.rglob("*") if p.is_file()):
+        digest.update(str(path.relative_to(root)).encode())
+        digest.update(b"\0")
+        digest.update(path.read_bytes())
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
+def backup_file(path: Path) -> Path | None:
+    if not path.exists():
+        return None
+    dest = BACKUP_DIR / timestamp() / path.name
+    suffix = 1
+    while dest.exists():
+        dest = dest.with_name(f"{path.name}.{suffix}")
+        suffix += 1
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(path, dest)
+    return dest
+
+
+def quarantine(path: Path) -> Path | None:
+    if not path.exists() and not path.is_symlink():
+        return None
+    dest = QUARANTINE_DIR / timestamp() / path.name
+    suffix = 1
+    while dest.exists():
+        dest = dest.with_name(f"{path.name}.{suffix}")
+        suffix += 1
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    shutil.move(str(path), str(dest))
+    return dest
+
+
+def run_git(*args: str, check: bool = False) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["git", "-C", str(REPO_ROOT), *args],
+        text=True,
+        capture_output=True,
+        check=check,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Targets
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class Target:
+    name: str
+    binary: str | None
+    base: Path
+    skills_dir: Path | None
+    mcp_config: Path | None
+    mcp_format: str | None
+    skills_mode: str = "link"  # link | external | none
+    mcp_key: str = "mcp_servers"
+    mcp_nested: bool = False
+
+    def detected(self) -> bool:
+        return self.base.exists() or bool(self.binary and shutil.which(self.binary))
+
+
+def default_targets() -> dict[str, Target]:
+    home = Path.home()
+    codex_home = expand_path(os.environ.get("CODEX_HOME", home / ".codex"))
+    xdg_config = expand_path(os.environ.get("XDG_CONFIG_HOME", home / ".config"))
+    hermes_home = expand_path(os.environ.get("HERMES_HOME", home / ".hermes"))
+
+    return {
+        "agents": Target(
+            name="agents",
+            binary=None,
+            base=home / ".agents",
+            skills_dir=home / ".agents" / "skills",
+            mcp_config=None,
+            mcp_format=None,
+        ),
+        "codex": Target(
+            name="codex",
+            binary="codex",
+            base=codex_home,
+            skills_dir=codex_home / "skills",
+            mcp_config=codex_home / "config.toml",
+            mcp_format="codex-toml",
+        ),
+        "opencode": Target(
+            name="opencode",
+            binary="opencode",
+            base=xdg_config / "opencode",
+            skills_dir=xdg_config / "opencode" / "skills",
+            mcp_config=xdg_config / "opencode" / "opencode.jsonc",
+            mcp_format="opencode-json",
+            skills_mode="external",
+        ),
+        "hermes": Target(
+            name="hermes",
+            binary="hermes",
+            base=hermes_home,
+            skills_dir=hermes_home / "skills",
+            mcp_config=hermes_home / "config.yaml",
+            mcp_format="hermes-yaml",
+            skills_mode="external",
+        ),
+        "claude": Target(
+            name="claude",
+            binary="claude",
+            base=home / ".claude",
+            skills_dir=home / ".claude" / "skills",
+            mcp_config=home / ".claude.json",
+            mcp_format="claude-json",
+        ),
+        "gemini": Target(
+            name="gemini",
+            binary="gemini",
+            base=home / ".gemini",
+            skills_dir=home / ".gemini" / "skills",
+            mcp_config=None,  # skills only until the MCP shape is verified
+            mcp_format=None,
+        ),
+    }
+
+
+def load_hub() -> dict[str, Any]:
+    if not HUB_CONFIG.exists():
+        fail(f"missing {HUB_CONFIG}")
+        sys.exit(2)
+    data = load_yaml(HUB_CONFIG)
+    if not isinstance(data, dict):
+        fail(f"{HUB_CONFIG} must contain a mapping")
+        sys.exit(2)
+    return data
+
+
+def build_targets(hub: dict[str, Any], selected: list[str] | None) -> list[Target]:
+    targets = default_targets()
+    overrides = hub.get("targets") or {}
+    if not isinstance(overrides, dict):
+        fail("hub.yaml: targets must be a mapping")
+        sys.exit(2)
+
+    result: list[Target] = []
+    for name, target in targets.items():
+        cfg = overrides.get(name) or {}
+        if not isinstance(cfg, dict):
+            fail(f"hub.yaml: targets.{name} must be a mapping")
+            sys.exit(2)
+        target.skills_dir = expand_path(cfg["skills_dir"]) if cfg.get("skills_dir") else target.skills_dir
+        target.mcp_config = expand_path(cfg["mcp_config"]) if cfg.get("mcp_config") else target.mcp_config
+        target.skills_mode = cfg.get("skills_mode", target.skills_mode)
+        target.mcp_format = cfg.get("mcp_format", target.mcp_format)
+        target.mcp_key = cfg.get("mcp_key", target.mcp_key)
+        target.mcp_nested = bool(cfg.get("mcp_nested", target.mcp_nested))
+
+        if selected:
+            enabled = name in selected
+        else:
+            state = cfg.get("enabled", "auto")
+            enabled = True if state is True else False if state is False else target.detected()
+            if name == "agents":
+                enabled = True
+        if enabled:
+            result.append(target)
+    return result
+
+
+@dataclass
+class RepoAssets:
+    skills_source: Path
+    skills_exclude: list[str]
+    assets: dict[str, dict[str, Any]]
+
+
+def load_assets(hub: dict[str, Any]) -> RepoAssets:
+    skills_cfg = hub.get("skills") or {}
+    source = expand_path(skills_cfg.get("source", DEFAULT_SKILLS_SOURCE))
+    if not source.is_absolute():
+        source = REPO_ROOT / source
+    exclude = list(skills_cfg.get("exclude") or [])
+    assets = hub.get("assets") or {}
+    if not isinstance(assets, dict):
+        fail("hub.yaml: assets must be a mapping")
+        sys.exit(2)
+    for name, cfg in assets.items():
+        if not isinstance(cfg, dict) or "source" not in cfg or "install" not in cfg:
+            fail(f"hub.yaml: assets.{name} needs source and install")
+            sys.exit(2)
+    return RepoAssets(source, exclude, assets)
+
+
+def discover_skills(assets: RepoAssets) -> dict[str, Path]:
+    """Return {relative skill path: directory containing SKILL.md}."""
+    if not assets.skills_source.exists():
+        return {}
+    found: dict[str, Path] = {}
+    for skill_md in assets.skills_source.rglob("SKILL.md"):
+        rel_dir = skill_md.parent.relative_to(assets.skills_source)
+        rel = rel_dir.as_posix()
+        if any(part.startswith(".") and part not in {".agents"} for part in rel_dir.parts):
+            continue
+        if any(part in {"node_modules", "__pycache__"} for part in rel_dir.parts):
+            continue
+        if any(_matches(rel, pattern) for pattern in assets.skills_exclude):
+            continue
+        found[rel] = skill_md.parent
+    return dict(sorted(found.items()))
+
+
+def _matches(value: str, pattern: str) -> bool:
+    import fnmatch
+
+    return fnmatch.fnmatch(value, pattern) or fnmatch.fnmatch(Path(value).name, pattern)
+
+
+# ---------------------------------------------------------------------------
+# State
+# ---------------------------------------------------------------------------
+
+
+def load_state() -> dict[str, Any]:
+    if not STATE_FILE.exists():
+        return {"version": 1, "links": {}, "mcp": {}, "external_added": {}}
+    try:
+        data = json.loads(read_text(STATE_FILE))
+    except (json.JSONDecodeError, OSError):
+        warn(f"state file is unreadable, starting fresh: {STATE_FILE}")
+        return {"version": 1, "links": {}, "mcp": {}, "external_added": {}}
+    data.setdefault("links", {})
+    data.setdefault("mcp", {})
+    data.setdefault("external_added", {})
+    return data
+
+
+def save_state(state: dict[str, Any]) -> None:
+    state["version"] = 1
+    state["repo"] = str(REPO_ROOT)
+    state["updated_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    atomic_write(STATE_FILE, dump_json(state))
+
+
+# ---------------------------------------------------------------------------
+# Skill installation
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class LinkResult:
+    linked: int = 0
+    kept: int = 0
+    conflicts: list[str] = field(default_factory=list)
+    pruned: list[str] = field(default_factory=list)
+
+
+def install_skills(
+    target: Target,
+    skills: dict[str, Path],
+    state: dict[str, Any],
+    *,
+    copy_mode: bool,
+    force: bool,
+    prune: bool,
+    dry_run: bool,
+) -> LinkResult:
+    result = LinkResult()
+    if target.skills_dir is None or target.skills_mode == "none":
+        return result
+    if target.skills_mode == "external":
+        return result
+
+    managed: dict[str, str] = state["links"].setdefault(target.name, {})
+    desired: dict[str, str] = {}
+
+    for rel, source in skills.items():
+        dest = target.skills_dir / rel
+        desired[rel] = str(source)
+
+        if dest.is_symlink() and dest.resolve() == source.resolve():
+            result.kept += 1
+            continue
+
+        if dest.exists() or dest.is_symlink():
+            if not force:
+                result.conflicts.append(rel)
+                continue
+            if dry_run:
+                result.linked += 1
+                continue
+            quarantined = quarantine(dest)
+            warn(f"{target.name}: moved conflicting {rel} to {quarantined}")
+
+        if dry_run:
+            result.linked += 1
+            continue
+
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        if copy_mode:
+            shutil.copytree(source, dest)
+        else:
+            try:
+                os.symlink(source, dest)
+            except OSError as exc:
+                warn(f"{target.name}: symlink failed ({exc}); copying {rel} instead")
+                shutil.copytree(source, dest)
+        result.linked += 1
+
+    if prune:
+        for rel in list(managed):
+            if rel in desired:
+                continue
+            dest = target.skills_dir / rel
+            if dest.is_symlink() or (copy_mode and dest.exists()):
+                if not dry_run:
+                    if dest.is_symlink():
+                        dest.unlink()
+                    else:
+                        shutil.rmtree(dest)
+                result.pruned.append(rel)
+            managed.pop(rel, None)
+
+    if not dry_run:
+        managed.update(desired)
+        # Drop stale entries for links that no longer exist.
+        state["links"][target.name] = {
+            rel: src for rel, src in managed.items() if (target.skills_dir / rel).exists() or (target.skills_dir / rel).is_symlink()
+        }
+    return result
+
+
+# ---------------------------------------------------------------------------
+# MCP catalog
+# ---------------------------------------------------------------------------
+
+
+def load_mcp_catalog() -> dict[str, dict[str, Any]]:
+    if not MCP_CATALOG.exists():
+        return {}
+    base = load_yaml(MCP_CATALOG)
+    if not isinstance(base, dict):
+        fail(f"{MCP_CATALOG} must contain a mapping")
+        sys.exit(2)
+    if MCP_LOCAL.exists():
+        local = load_yaml(MCP_LOCAL)
+        if isinstance(local, dict):
+            base = deep_merge(base, local)
+    servers = base.get("servers") or {}
+    if not isinstance(servers, dict):
+        fail(f"{MCP_CATALOG}: servers must be a mapping")
+        sys.exit(2)
+
+    normalized: dict[str, dict[str, Any]] = {}
+    for name, entry in servers.items():
+        if not isinstance(entry, dict):
+            fail(f"MCP server {name} must be a mapping")
+            sys.exit(2)
+        item = copy.deepcopy(entry)
+        item.setdefault("enabled", True)
+        item.setdefault("transport", "http" if item.get("url") else "stdio")
+        item.setdefault("targets", None)
+        if item["transport"] == "stdio" and not item.get("command"):
+            fail(f"MCP server {name}: stdio transport needs command")
+            sys.exit(2)
+        if item["transport"] == "http" and not item.get("url"):
+            fail(f"MCP server {name}: http transport needs url")
+            sys.exit(2)
+        normalized[name] = item
+    return normalized
+
+
+def servers_for(target: Target, servers: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    selected: dict[str, dict[str, Any]] = {}
+    for name, entry in servers.items():
+        if not entry.get("enabled", True):
+            continue
+        allowed = entry.get("targets")
+        if allowed and target.name not in allowed:
+            continue
+        selected[name] = entry
+    return selected
+
+
+def _substitute_opencode(value: str) -> str:
+    return PLACEHOLDER.sub(lambda m: "{env:" + m.group(1) + "}", value)
+
+
+# ---------------------------------------------------------------------------
+# Native config rendering
+# ---------------------------------------------------------------------------
+
+
+def render_opencode(entry: dict[str, Any], nested: bool) -> dict[str, Any]:
+    if entry["transport"] == "stdio":
+        out: dict[str, Any] = {
+            "type": "local",
+            "command": [entry["command"], *entry.get("args", [])],
+        }
+        env = entry.get("env") or {}
+        if env:
+            out["environment"] = {k: _substitute_opencode(str(v)) for k, v in env.items()}
+        if entry.get("cwd"):
+            out["cwd"] = entry["cwd"]
+    else:
+        out = {"type": "remote", "url": entry["url"]}
+        headers = entry.get("headers") or {}
+        if headers:
+            out["headers"] = {k: _substitute_opencode(str(v)) for k, v in headers.items()}
+            out["oauth"] = bool(entry.get("oauth", False))
+        elif entry.get("oauth"):
+            out["oauth"] = True
+
+    if nested:
+        if not entry.get("enabled", True):
+            out["disabled"] = True
+    else:
+        out["enabled"] = bool(entry.get("enabled", True))
+    return out
+
+
+def render_codex(entry: dict[str, Any]) -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    if entry["transport"] == "stdio":
+        out["command"] = entry["command"]
+        if entry.get("args"):
+            out["args"] = list(entry["args"])
+        env_literals: dict[str, str] = {}
+        env_vars: list[str] = []
+        for key, value in (entry.get("env") or {}).items():
+            value = str(value)
+            match = PLACEHOLDER_FULL.match(value)
+            if match:
+                env_vars.append(match.group(1))
+            elif PLACEHOLDER.search(value):
+                warn(
+                    f"codex: {key} mixes text and ${{VAR}}; Codex cannot interpolate it. "
+                    "Use an exact ${VAR} reference or a literal value."
+                )
+                env_literals[key] = value
+            else:
+                env_literals[key] = value
+        if env_literals:
+            out["env"] = env_literals
+        if env_vars:
+            out["env_vars"] = sorted(set(env_vars))
+        if entry.get("cwd"):
+            out["cwd"] = entry["cwd"]
+    else:
+        out["url"] = entry["url"]
+        headers = entry.get("headers") or {}
+        literal_headers: dict[str, str] = {}
+        env_headers: dict[str, str] = {}
+        for key, value in headers.items():
+            value = str(value)
+            bearer = re.fullmatch(r"Bearer\s+\$\{([A-Za-z_][A-Za-z0-9_]*)\}", value)
+            exact = PLACEHOLDER_FULL.match(value)
+            if key.lower() == "authorization" and bearer:
+                out["bearer_token_env_var"] = bearer.group(1)
+            elif exact:
+                env_headers[key] = exact.group(1)
+            else:
+                literal_headers[key] = value
+        if literal_headers:
+            out["http_headers"] = literal_headers
+        if env_headers:
+            out["env_http_headers"] = env_headers
+        if entry.get("auth"):
+            out["auth"] = entry["auth"]
+    if entry.get("enabled") is False:
+        out["enabled"] = False
+    for key in ("startup_timeout_sec", "tool_timeout_sec", "enabled_tools", "disabled_tools"):
+        if key in entry:
+            out[key] = entry[key]
+    return out
+
+
+def render_hermes(entry: dict[str, Any]) -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    if entry["transport"] == "stdio":
+        out["command"] = entry["command"]
+        if entry.get("args"):
+            out["args"] = list(entry["args"])
+        if entry.get("env"):
+            out["env"] = dict(entry["env"])
+        if entry.get("cwd"):
+            out["cwd"] = entry["cwd"]
+    else:
+        out["url"] = entry["url"]
+        if entry.get("headers"):
+            out["headers"] = dict(entry["headers"])
+        if entry.get("auth"):
+            out["auth"] = entry["auth"]
+    if entry.get("enabled") is False:
+        out["enabled"] = False
+    for key in (
+        "timeout",
+        "connect_timeout",
+        "lazy",
+        "idle_timeout_seconds",
+        "max_lifetime_seconds",
+        "supports_parallel_tool_calls",
+        "tools",
+        "identity_header",
+    ):
+        if key in entry:
+            out[key] = entry[key]
+    return out
+
+
+def render_claude(entry: dict[str, Any]) -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    if entry["transport"] == "stdio":
+        out["command"] = entry["command"]
+        if entry.get("args"):
+            out["args"] = list(entry["args"])
+        if entry.get("env"):
+            out["env"] = dict(entry["env"])
+        if entry.get("cwd"):
+            out["cwd"] = entry["cwd"]
+    else:
+        out["type"] = "http"
+        out["url"] = entry["url"]
+        if entry.get("headers"):
+            out["headers"] = dict(entry["headers"])
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Native config read/write
+# ---------------------------------------------------------------------------
+
+
+def read_native_servers(target: Target) -> dict[str, Any]:
+    if target.mcp_config is None or target.mcp_format is None:
+        return {}
+    path = target.mcp_config
+    if not path.exists():
+        return {}
+    try:
+        if target.mcp_format == "codex-toml":
+            doc = tomlkit.parse(read_text(path))
+            servers = doc.get("mcp_servers") or {}
+            return {name: _toml_plain(servers[name]) for name in servers}
+        if target.mcp_format in {"opencode-json", "claude-json"}:
+            data = load_jsonc(path)
+            if target.mcp_format == "opencode-json":
+                mcp = data.get("mcp") or {}
+                container = mcp.get("servers") if isinstance(mcp.get("servers"), dict) else mcp
+                return {k: v for k, v in container.items() if isinstance(v, dict)}
+            return {k: v for k, v in (data.get("mcpServers") or {}).items()}
+        if target.mcp_format == "hermes-yaml":
+            data = load_yaml(path)
+            return {k: v for k, v in (data.get("mcp_servers") or {}).items()}
+    except Exception as exc:  # noqa: BLE001 - report parse errors per target
+        warn(f"{target.name}: cannot parse {path}: {exc}")
+    return {}
+
+
+def _toml_plain(table: Any) -> Any:
+    import tomllib
+
+    return tomllib.loads(tomlkit.dumps({"x": table}))["x"]
+
+
+def write_native_servers(
+    target: Target,
+    entries: dict[str, dict[str, Any]],
+    *,
+    prune: bool,
+    managed_before: list[str],
+    dry_run: bool,
+) -> tuple[list[str], list[str], Path | None]:
+    """Write desired MCP entries; return (added_or_updated, removed, backup)."""
+    if target.mcp_config is None or target.mcp_format is None:
+        return [], [], None
+    path = target.mcp_config
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    desired = {name: _render_for(target, entry) for name, entry in entries.items()}
+    existing = read_native_servers(target)
+    changed = [name for name, value in desired.items() if existing.get(name) != value]
+    removed: list[str] = []
+    if prune:
+        removed = [name for name in managed_before if name not in desired and name in existing]
+    if not changed and not removed:
+        return [], [], None
+    if dry_run:
+        return changed, removed, None
+
+    backup = backup_file(path)
+    now = timestamp()
+
+    if target.mcp_format == "codex-toml":
+        doc = tomlkit.parse(read_text(path)) if path.exists() else tomlkit.document()
+        servers = doc.get("mcp_servers")
+        if servers is None:
+            servers = tomlkit.table()
+            doc["mcp_servers"] = servers
+        for name in removed:
+            if name in servers:
+                del servers[name]
+        for name, value in desired.items():
+            servers[name] = value
+        text = tomlkit.dumps(doc)
+        tomlkit.parse(text)  # validate
+        atomic_write(path, text)
+
+    elif target.mcp_format == "opencode-json":
+        data = load_jsonc(path) if path.exists() else {"$schema": "https://opencode.ai/config.json"}
+        mcp = data.get("mcp")
+        if not isinstance(mcp, dict):
+            mcp = {}
+            data["mcp"] = mcp
+        nested = target.mcp_nested or not path.exists() or isinstance(mcp.get("servers"), dict)
+        container = mcp.setdefault("servers", {}) if nested else mcp
+        for name in removed:
+            container.pop(name, None)
+        for name, entry in desired.items():
+            container[name] = entry
+        atomic_write(path, dump_json(data))
+        load_jsonc(path)  # validate
+
+    elif target.mcp_format == "hermes-yaml":
+        yaml = YAML()
+        yaml.preserve_quotes = True
+        yaml.width = 4096
+        yaml.indent(mapping=2, sequence=4, offset=2)
+        if path.exists():
+            with path.open(encoding="utf-8") as handle:
+                data = yaml.load(handle) or CommentedMap()
+        else:
+            data = CommentedMap()
+        if not isinstance(data, CommentedMap):
+            data = CommentedMap(data)
+        servers = data.get("mcp_servers")
+        if not isinstance(servers, dict):
+            servers = CommentedMap()
+            data["mcp_servers"] = servers
+        for name in removed:
+            if name in servers:
+                del servers[name]
+        for name, entry in desired.items():
+            servers[name] = entry
+        from io import StringIO
+
+        buffer = StringIO()
+        yaml.dump(data, buffer)
+        text = buffer.getvalue()
+        yaml.load(text)  # validate
+        atomic_write(path, text)
+
+    elif target.mcp_format == "claude-json":
+        data = load_jsonc(path) if path.exists() else {}
+        servers = data.get("mcpServers")
+        if not isinstance(servers, dict):
+            servers = {}
+            data["mcpServers"] = servers
+        for name in removed:
+            servers.pop(name, None)
+        for name, entry in desired.items():
+            servers[name] = entry
+        atomic_write(path, dump_json(data))
+        load_jsonc(path)  # validate
+
+    else:
+        fail(f"{target.name}: unsupported mcp_format {target.mcp_format}")
+        return [], [], None
+
+    return changed, removed, backup
+
+
+def ensure_hermes_external_dir(
+    target: Target, state: dict[str, Any], *, dry_run: bool
+) -> str | None:
+    if target.name != "hermes" or target.skills_mode != "external":
+        return None
+    path = target.mcp_config
+    if path is None or not path.exists():
+        warn("hermes: config not found; run `hermes setup` once, then `agenthub sync`")
+        return None
+    external = "~/.agents/skills"
+    try:
+        with path.open(encoding="utf-8") as handle:
+            yaml = YAML()
+            yaml.preserve_quotes = True
+            data = yaml.load(handle) or CommentedMap()
+    except Exception as exc:  # noqa: BLE001
+        warn(f"hermes: cannot read {path}: {exc}")
+        return None
+
+    if not isinstance(data, dict):
+        return None
+    skills = data.get("skills")
+    if not isinstance(skills, dict):
+        skills = CommentedMap()
+        data["skills"] = skills
+    dirs = skills.get("external_dirs")
+    if not isinstance(dirs, list):
+        dirs = CommentedSeq()
+        skills["external_dirs"] = dirs
+    if external in [str(item) for item in dirs]:
+        return None
+    if dry_run:
+        return f"add {external} to skills.external_dirs"
+    dirs.append(external)
+    state.setdefault("external_added", {})["hermes"] = True
+    backup_file(path)
+    from io import StringIO
+
+    buffer = StringIO()
+    yaml.dump(data, buffer)
+    atomic_write(path, buffer.getvalue())
+    return f"added {external} to skills.external_dirs"
+
+
+# ---------------------------------------------------------------------------
+# Commands
+# ---------------------------------------------------------------------------
+
+
+def cmd_sync(args: argparse.Namespace) -> int:
+    hub = load_hub()
+    assets = load_assets(hub)
+    targets = build_targets(hub, args.target)
+    servers = load_mcp_catalog()
+    skills = discover_skills(assets)
+    state = load_state()
+
+    if not targets:
+        warn("no targets detected; use --target codex,opencode,hermes")
+        return 1
+
+    info(f"repo: {REPO_ROOT}")
+    info(f"skills: {len(skills)} discovered in {assets.skills_source}")
+    info(f"targets: {', '.join(t.name for t in targets)}")
+    if args.dry_run:
+        info("dry run: no changes will be written")
+
+    # A shared external directory only works if the `agents` target is synced.
+    shared_skills = Path.home() / ".agents" / "skills"
+    if (
+        any(t.skills_mode == "external" for t in targets)
+        and not any(t.name == "agents" for t in targets)
+        and not shared_skills.exists()
+    ):
+        warn("external skill targets need the 'agents' target; add it to --target")
+
+    sync_failed = False
+    for target in targets:
+        if target.skills_mode == "external":
+            if target.name == "hermes":
+                action = ensure_hermes_external_dir(target, state, dry_run=args.dry_run)
+                if action:
+                    ok(f"hermes: {action}")
+            continue
+        if target.skills_dir is None or target.skills_mode == "none":
+            continue
+        result = install_skills(
+            target,
+            skills,
+            state,
+            copy_mode=args.copy,
+            force=args.force,
+            prune=args.prune,
+            dry_run=args.dry_run,
+        )
+        detail = []
+        if result.linked:
+            detail.append(f"{result.linked} {'would link' if args.dry_run else 'linked'}")
+        if result.kept:
+            detail.append(f"{result.kept} ok")
+        if result.pruned:
+            detail.append(f"{result.pruned.__len__()} pruned")
+        if result.conflicts:
+            detail.append(f"{len(result.conflicts)} conflict(s)")
+            sync_failed = True
+        ok(f"{target.name}: {', '.join(detail) or 'nothing to do'} -> {target.skills_dir}")
+        for conflict in result.conflicts:
+            warn(f"{target.name}: exists and is not managed: {target.skills_dir / conflict} (use --force)")
+
+    for target in targets:
+        if target.mcp_format is None or target.mcp_config is None:
+            continue
+        entries = servers_for(target, servers)
+        managed_before = state["mcp"].get(target.name, [])
+        changed, removed, backup = write_native_servers(
+            target, entries, prune=args.prune, managed_before=managed_before, dry_run=args.dry_run
+        )
+        if not args.dry_run:
+            state["mcp"][target.name] = sorted(entries)
+        if changed or removed:
+            parts = []
+            if changed:
+                parts.append(("would update " if args.dry_run else "updated ") + ", ".join(sorted(changed)))
+            if removed:
+                parts.append(("would remove " if args.dry_run else "removed ") + ", ".join(sorted(removed)))
+            ok(f"{target.name}: {'; '.join(parts)} -> {target.mcp_config}")
+            if backup:
+                info(f"{target.name}: backup {backup}")
+        else:
+            ok(f"{target.name}: mcp config already in sync -> {target.mcp_config}")
+
+    # Generic assets (rules, commands, prompts) use the same link machinery.
+    for name, cfg in assets.assets.items():
+        source = expand_path(cfg["source"])
+        if not source.is_absolute():
+            source = REPO_ROOT / source
+        for target_name, dest_value in (cfg.get("install") or {}).items():
+            target = next((t for t in targets if t.name == target_name), None)
+            if target is None:
+                continue
+            dest_root = expand_path(dest_value)
+            _sync_generic_asset(
+                name, source, dest_root, state, force=args.force, prune=args.prune, dry_run=args.dry_run
+            )
+
+    if not args.dry_run:
+        save_state(state)
+        ok(f"state saved: {STATE_FILE}")
+    return 1 if sync_failed else 0
+
+
+def _opencode_is_nested(target: Target) -> bool:
+    if target.mcp_nested:
+        return True
+    if target.mcp_config is None or not target.mcp_config.exists():
+        return True
+    try:
+        data = load_jsonc(target.mcp_config)
+    except Exception:  # noqa: BLE001
+        return True
+    mcp = data.get("mcp")
+    return isinstance(mcp, dict) and isinstance(mcp.get("servers"), dict)
+
+
+def _render_for(target: Target, entry: dict[str, Any]) -> dict[str, Any]:
+    if target.mcp_format == "opencode-json":
+        return render_opencode(entry, nested=_opencode_is_nested(target))
+    if target.mcp_format == "codex-toml":
+        return render_codex(entry)
+    if target.mcp_format == "hermes-yaml":
+        return render_hermes(entry)
+    if target.mcp_format == "claude-json":
+        return render_claude(entry)
+    return {}
+
+
+def _sync_generic_asset(
+    name: str,
+    source: Path,
+    dest_root: Path,
+    state: dict[str, Any],
+    *,
+    force: bool,
+    prune: bool,
+    dry_run: bool,
+) -> None:
+    if not source.exists():
+        warn(f"asset {name}: missing source {source}")
+        return
+    key = f"asset:{name}:{dest_root}"
+    managed = state["links"].setdefault(key, {})
+    desired: dict[str, str] = {}
+    for item in source.iterdir():
+        if item.name.startswith("."):
+            continue
+        dest = dest_root / item.name
+        desired[item.name] = str(item)
+        if dest.exists() or dest.is_symlink():
+            if dest.is_symlink() and dest.resolve() == item.resolve():
+                continue
+            if not force:
+                warn(f"asset {name}: conflict at {dest} (use --force)")
+                continue
+            if not dry_run:
+                quarantine(dest)
+        if not dry_run:
+            dest_root.mkdir(parents=True, exist_ok=True)
+            os.symlink(item, dest)
+    if prune:
+        for rel in list(managed):
+            if rel in desired:
+                continue
+            dest = dest_root / rel
+            if dest.is_symlink():
+                if not dry_run:
+                    dest.unlink()
+                managed.pop(rel, None)
+    if not dry_run:
+        managed.update(desired)
+
+
+def cmd_update(args: argparse.Namespace) -> int:
+    if not (REPO_ROOT / ".git").exists():
+        fail(f"{REPO_ROOT} is not a git checkout; update manually")
+        return 1
+    status = run_git("status", "--porcelain", "--untracked-files=no")
+    if status.returncode != 0:
+        fail(status.stderr.strip() or "git status failed")
+        return 1
+    if status.stdout.strip():
+        warn("repo has local changes; commit or stash them before update")
+        say(status.stdout.rstrip())
+        if not args.force:
+            return 1
+    info(f"git pull --ff-only in {REPO_ROOT}")
+    if args.dry_run:
+        run_git("fetch", "--dry-run")
+        info("dry run: skipped pull")
+    else:
+        pulled = run_git("pull", "--ff-only")
+        if pulled.stdout.strip():
+            say(pulled.stdout.rstrip())
+        if pulled.returncode != 0:
+            fail(pulled.stderr.strip() or "git pull failed")
+            return 1
+    return cmd_sync(args)
+
+
+def cmd_status(args: argparse.Namespace) -> int:
+    hub = load_hub()
+    assets = load_assets(hub)
+    targets = build_targets(hub, None)
+    servers = load_mcp_catalog()
+    skills = discover_skills(assets)
+    state = load_state()
+
+    say("")
+    say(f"{BLUE}agenthub status{RESET}  {REPO_ROOT}")
+    branch = run_git("rev-parse", "--abbrev-ref", "HEAD")
+    head = run_git("log", "-1", "--format=%h %s")
+    if branch.returncode == 0:
+        say(f"  branch   {branch.stdout.strip()}  {head.stdout.strip() if head.returncode == 0 else ''}")
+    upstream = run_git("rev-list", "--left-right", "--count", "HEAD...@{upstream}")
+    if upstream.returncode == 0:
+        ahead, behind = upstream.stdout.split()
+        say(f"  remote   {behind} behind, {ahead} ahead")
+    dirty = run_git("status", "--porcelain", "--untracked-files=no")
+    if dirty.returncode == 0 and dirty.stdout.strip():
+        warn(f"repo has uncommitted changes ({len(dirty.stdout.splitlines())} files)")
+
+    say("")
+    say(f"{BLUE}skills{RESET}  {len(skills)} in {assets.skills_source}")
+    for target in targets:
+        if target.skills_mode == "external":
+            say(f"  {target.name:<9} external via ~/.agents/skills")
+            continue
+        if target.skills_dir is None or target.skills_mode == "none":
+            continue
+        missing = []
+        drift = []
+        for rel, source in skills.items():
+            dest = target.skills_dir / rel
+            if not dest.exists() and not dest.is_symlink():
+                missing.append(rel)
+            elif dest.is_symlink() and dest.resolve() != source.resolve():
+                drift.append(rel)
+        managed = state["links"].get(target.name, {})
+        extra = [rel for rel in managed if rel not in skills and (target.skills_dir / rel).is_symlink()]
+        bits = [f"{len(skills) - len(missing)}/{len(skills)} present"]
+        if missing:
+            bits.append(f"{len(missing)} missing")
+        if drift:
+            bits.append(f"{len(drift)} drift")
+        if extra:
+            bits.append(f"{len(extra)} prune")
+        line = f"  {target.name:<9} {', '.join(bits)}  {target.skills_dir}"
+        (warn if missing or drift or extra else say)(line)
+
+    say("")
+    say(f"{BLUE}mcp{RESET}  {sum(1 for s in servers.values() if s.get('enabled', True))} enabled of {len(servers)}")
+    for target in targets:
+        if target.mcp_format is None or target.mcp_config is None:
+            continue
+        desired = {name: _render_for(target, entry) for name, entry in servers_for(target, servers).items()}
+        existing = read_native_servers(target)
+        new = [n for n in desired if n not in existing]
+        stale = [n for n, v in desired.items() if n in existing and existing[n] != v]
+        managed = state["mcp"].get(target.name, [])
+        extra = [n for n in managed if n not in desired and n in existing]
+        bits = [f"{len(desired) - len(new) - len(stale)}/{len(desired)} in sync"]
+        if new:
+            bits.append(f"{len(new)} new")
+        if stale:
+            bits.append(f"{len(stale)} drift")
+        if extra:
+            bits.append(f"{len(extra)} prune")
+        line = f"  {target.name:<9} {', '.join(bits)}  {target.mcp_config}"
+        (warn if new or stale or extra else say)(line)
+
+    say("")
+    return 0
+
+
+def cmd_doctor(args: argparse.Namespace) -> int:
+    issues = 0
+    say(f"agenthub doctor\n  repo: {REPO_ROOT}")
+    say(f"  python: {sys.version.split()[0]}")
+
+    for tool in ("git", "uv"):
+        path = shutil.which(tool)
+        if path:
+            ok(f"{tool}: {path}")
+        else:
+            fail(f"{tool}: not found")
+            issues += 1
+
+    try:
+        hub = load_hub()
+        assets = load_assets(hub)
+        servers = load_mcp_catalog()
+    except SystemExit:
+        return 1
+    except Exception as exc:  # noqa: BLE001
+        fail(f"config parse failed: {exc}")
+        return 1
+    ok(f"hub.yaml: valid ({len(servers)} MCP servers)")
+    skills = discover_skills(assets)
+    ok(f"skills: {len(skills)} discovered")
+
+    say("\n  targets:")
+    for target in build_targets(hub, None):
+        status = "detected" if target.detected() else "forced"
+        line = f"    {target.name:<9} {status:<8} skills={target.skills_dir}"
+        if target.mcp_config:
+            line += f" mcp={target.mcp_config}"
+        say(line)
+        if target.mcp_config and target.mcp_config.exists() and target.mcp_format:
+            try:
+                read_native_servers(target)
+            except Exception as exc:  # noqa: BLE001
+                fail(f"    {target.name}: cannot parse {target.mcp_config}: {exc}")
+                issues += 1
+
+    missing_env: set[str] = set()
+    for entry in servers.values():
+        for value in list((entry.get("env") or {}).values()) + list((entry.get("headers") or {}).values()):
+            missing_env.update(PLACEHOLDER.findall(str(value)))
+    absent = sorted(var for var in missing_env if var not in os.environ)
+    say("\n  secrets:")
+    if absent:
+        warn(f"not set in this shell: {', '.join(absent)}")
+        say("    Hermes also reads ~/.hermes/.env; Codex/OpenCode inherit the shell environment.")
+    else:
+        ok("all referenced environment variables are set")
+
+    head = run_git("rev-parse", "--short", "HEAD")
+    if head.returncode == 0:
+        ok(f"git: {head.stdout.strip()}")
+    else:
+        warn("not a git checkout; `agenthub update` is unavailable")
+
+    say("")
+    if issues:
+        fail(f"{issues} issue(s) found")
+        return 1
+    ok("no structural issues found")
+    return 0
+
+
+def cmd_mcp(args: argparse.Namespace) -> int:
+    servers = load_mcp_catalog()
+    if args.action == "list":
+        if not servers:
+            say("no MCP servers in the catalog")
+            return 0
+        for name, entry in sorted(servers.items()):
+            state = "on" if entry.get("enabled", True) else "off"
+            targets = ",".join(entry.get("targets") or ["all"])
+            transport = entry.get("transport")
+            detail = entry.get("url") or " ".join([entry.get("command", ""), *entry.get("args", [])])
+            say(f"  {name:<20} {state:<3} {transport:<5} {targets:<24} {detail}")
+        return 0
+    fail(f"unknown mcp action: {args.action}")
+    return 1
+
+
+def cmd_version(args: argparse.Namespace) -> int:
+    say("agenthub 1.0.0")
+    return 0
+
+
+def set_local_mcp_enabled(name: str, enabled: bool) -> Path:
+    """Toggle an MCP server for this device in mcp/servers.local.yaml."""
+    path = MCP_LOCAL
+    yaml = YAML()
+    yaml.preserve_quotes = True
+    yaml.width = 4096
+    yaml.indent(mapping=2, sequence=4, offset=2)
+    if path.exists():
+        with path.open(encoding="utf-8") as handle:
+            data = yaml.load(handle) or CommentedMap()
+    else:
+        data = CommentedMap()
+    if not isinstance(data, dict):
+        data = CommentedMap()
+    servers = data.get("servers")
+    if not isinstance(servers, dict):
+        servers = CommentedMap()
+        data["servers"] = servers
+    entry = servers.get(name)
+    if not isinstance(entry, dict):
+        entry = CommentedMap()
+        servers[name] = entry
+    entry["enabled"] = bool(enabled)
+
+    from io import StringIO
+
+    buffer = StringIO()
+    yaml.dump(data, buffer)
+    atomic_write(path, buffer.getvalue())
+    yaml.load(buffer.getvalue())  # validate
+    return path
+
+
+def local_mcp_names() -> set[str]:
+    if not MCP_LOCAL.exists():
+        return set()
+    data = load_yaml(MCP_LOCAL)
+    servers = data.get("servers") if isinstance(data, dict) else None
+    return set(servers) if isinstance(servers, dict) else set()
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="agenthub",
+        description="Sync skills and MCP servers from a Git repo into local agents.",
+    )
+    parser.add_argument("--version", action="version", version="agenthub 1.0.0")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    def add_sync_flags(p: argparse.ArgumentParser) -> None:
+        p.add_argument("--target", action="append", help="target name(s), repeatable or comma-separated")
+        p.add_argument("--dry-run", action="store_true", help="show the plan without writing")
+        p.add_argument("--force", action="store_true", help="quarantine conflicting files and replace them")
+        p.add_argument("--prune", action="store_true", help="remove links/entries no longer in the repo")
+        p.add_argument("--copy", action="store_true", help="copy skills instead of symlinking")
+
+    sync = sub.add_parser("sync", help="materialize skills and MCP config")
+    add_sync_flags(sync)
+
+    update = sub.add_parser("update", help="git pull --ff-only, then sync")
+    add_sync_flags(update)
+
+    status = sub.add_parser("status", help="show drift")
+
+    sub.add_parser("doctor", help="diagnose the installation")
+
+    mcp = sub.add_parser("mcp", help="inspect the MCP catalog")
+    mcp.add_argument("action", choices=["list"], nargs="?", default="list")
+
+    sub.add_parser("tui", help="launch the terminal UI")
+
+    sub.add_parser("version", help="print version")
+    return parser
+
+
+def normalize_targets(values: list[str] | None) -> list[str] | None:
+    if not values:
+        return None
+    out: list[str] = []
+    for value in values:
+        out.extend(part.strip() for part in value.split(",") if part.strip())
+    known = set(default_targets())
+    unknown = [name for name in out if name not in known]
+    if unknown:
+        fail(f"unknown target(s): {', '.join(unknown)} (known: {', '.join(sorted(known))})")
+        sys.exit(2)
+    return out
+
+
+def main() -> int:
+    parser = build_parser()
+    args = parser.parse_args()
+    if hasattr(args, "target"):
+        args.target = normalize_targets(args.target)
+    if args.command == "sync":
+        return cmd_sync(args)
+    if args.command == "update":
+        return cmd_update(args)
+    if args.command == "status":
+        return cmd_status(args)
+    if args.command == "doctor":
+        return cmd_doctor(args)
+    if args.command == "mcp":
+        return cmd_mcp(args)
+    if args.command == "tui":
+        from agenthub_tui import run
+
+        return run()
+    if args.command == "version":
+        return cmd_version(args)
+    parser.print_help()
+    return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

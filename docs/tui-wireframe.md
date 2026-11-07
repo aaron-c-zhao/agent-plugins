@@ -1,6 +1,13 @@
 # agenthub TUI — wireframe (v1 draft)
 
-Status: design draft for review. No implementation yet.
+Status: MVP implemented in `agenthub_tui.py`. Launch with `agenthub tui`.
+
+Known MVP deviations from this draft:
+
+- Sync preview shows the CLI dry-run plan rather than a unified text diff.
+- `/` filtering is deferred.
+- `space` writes a device-local override and immediately syncs.
+- Update confirmation shows ahead/behind counts, not the changed-file list.
 
 Ideal terminal: **110×36**. Minimum: **80×24** (columns collapse).
 

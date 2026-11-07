@@ -39,6 +39,7 @@ installed globally.
 ## Daily use
 
 ```bash
+agenthub tui                 # interactive dashboard
 agenthub status              # what is out of sync on this device
 agenthub update              # git pull --ff-only, then sync
 agenthub sync                # re-materialize without pulling
@@ -129,7 +130,9 @@ overriding paths in `hub.yaml`. The adapters are intentionally small.
 
 ```
 agent-plugins/
-├── agenthub                 # the CLI (uv PEP 723 script)
+├── agenthub                 # CLI entry point (uv PEP 723 script)
+├── agenthub_core.py         # shared discovery/sync/config logic
+├── agenthub_tui.py          # Textual terminal UI
 ├── hub.yaml                 # targets, skill source, optional assets
 ├── mcp/
 │   ├── servers.yaml         # shared MCP catalog

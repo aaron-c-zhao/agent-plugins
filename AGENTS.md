@@ -22,6 +22,7 @@ config.
 ## Commands
 
 ```bash
+agenthub tui                     # interactive dashboard
 agenthub status                  # drift per target
 agenthub doctor                  # paths, parse errors, missing env vars
 agenthub sync                    # apply skills + MCP config
